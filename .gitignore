@@ -10,3 +10,6 @@ build/
 node_modules/
 venv/
 tests/
+
+# Ignore large example media files
+example/piped_video_calls/test.mkv
