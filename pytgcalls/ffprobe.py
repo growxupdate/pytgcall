@@ -30,6 +30,97 @@ class FFprobe:
         )
 
     @staticmethod
+    async def _read_streams(
+        path: str,
+        ffmpeg_params: List[str],
+    ):
+        ffprobe = await asyncio.create_subprocess_exec(
+            'ffprobe',
+            '-v',
+            'error',
+            '-analyzeduration',
+            '100M',
+            '-probesize',
+            '100M',
+            '-show_entries',
+            'stream=width,height,codec_type,codec_name',
+            '-of',
+            'json',
+            *tuple(ffmpeg_params),
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(
+                ffprobe.communicate(),
+                timeout=30,
+            )
+            result = json.loads(stdout.decode('utf-8')) or {}
+            return result.get('streams', [])
+        except (subprocess.TimeoutExpired, JSONDecodeError):
+            try:
+                ffprobe.kill()
+            except ProcessLookupError:
+                pass
+            return []
+
+    @staticmethod
+    async def _has_decodable_audio(
+        path: str,
+        ffmpeg_params: List[str],
+    ):
+        """Fallback for WebM/fragmented files where ffprobe misses audio.
+
+        Some growing/fragmented WebM files do not report all streams with the
+        short default probe, but ffmpeg still shows/decodes the audio stream.
+        """
+        ffmpeg = await asyncio.create_subprocess_exec(
+            'ffmpeg',
+            '-hide_banner',
+            '-v',
+            'info',
+            '-analyzeduration',
+            '100M',
+            '-probesize',
+            '100M',
+            *tuple(ffmpeg_params),
+            '-i',
+            path,
+            '-map',
+            '0:a:0',
+            '-t',
+            '1',
+            '-f',
+            'null',
+            '-',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(
+                ffmpeg.communicate(),
+                timeout=30,
+            )
+            message = stderr.decode('utf-8', errors='ignore')
+            if 'Audio:' in message:
+                return True
+            no_audio_errors = (
+                'Stream map \'0:a:0\' matches no streams',
+                'matches no streams',
+                'Output file #0 does not contain any stream',
+            )
+            return ffmpeg.returncode == 0 and not any(
+                err in message for err in no_audio_errors
+            )
+        except subprocess.TimeoutExpired:
+            try:
+                ffmpeg.kill()
+            except ProcessLookupError:
+                pass
+            return False
+
+    @staticmethod
     async def check_file(
         path: str,
         needed_audio=False,
@@ -48,29 +139,7 @@ class FFprobe:
                 built_header += f'{i}: {headers[i]}\r\n'
             ffmpeg_params.append(built_header)
         try:
-            ffprobe = await asyncio.create_subprocess_exec(
-                'ffprobe',
-                '-v',
-                'error',
-                '-show_entries',
-                'stream=width,height,codec_type,codec_name',
-                '-of',
-                'json',
-                path,
-                *tuple(ffmpeg_params),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stream_list = []
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    ffprobe.communicate(),
-                    timeout=30,
-                )
-                result = json.loads(stdout.decode('utf-8')) or {}
-                stream_list = result.get('streams', [])
-            except (subprocess.TimeoutExpired, JSONDecodeError):
-                pass
+            stream_list = await FFprobe._read_streams(path, ffmpeg_params)
             have_video = False
             have_audio = False
             have_valid_video = False
@@ -89,6 +158,11 @@ class FFprobe:
                         have_valid_video = True
                 elif codec_type == 'audio':
                     have_audio = True
+            if needed_audio and not have_audio:
+                have_audio = await FFprobe._has_decodable_audio(
+                    path,
+                    ffmpeg_params,
+                )
             if needed_video:
                 if not have_video:
                     raise NoVideoSourceFound(path)
